@@ -1,3 +1,8 @@
+![Release](https://img.shields.io/github/v/release/jjmhalew/ngx-unity)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/jjmhalew/ngx-unity)
+![Downloads](https://img.shields.io/npm/dw/ngx-unity)
+[![License](https://img.shields.io/:license-GNU-blue.svg?style=flat)](https://opensource.org/licenses/GNU)
+
 <img width="170" height="180" alt="ngx-unity logo" src="https://github.com/user-attachments/assets/2eb16db5-f296-49b0-a0af-a2e43a7d9ac0" />
 
 # ngx-unity
