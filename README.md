@@ -421,6 +421,5 @@ ngx-unity/
 
 ## TODO
 
-- [ ] Publish `ngx-unity` to npm
 - [ ] Distribute Unity scripts as a UPM package (git URL)
 - [ ] Auto-generate JSON serialization for complex Angular→Unity parameters
