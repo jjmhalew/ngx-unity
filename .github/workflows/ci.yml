@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  unity-build:
+    name: Unity WebGL Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - uses: actions/cache@v4
+        with:
+          path: example/unity-project/Library
+          key: Library-WebGL-${{ hashFiles('example/unity-project/Assets/**', 'example/unity-project/Packages/**', 'example/unity-project/ProjectSettings/**') }}
+          restore-keys: |
+            Library-WebGL-
+
+      # Unity version is read automatically from ProjectSettings/ProjectVersion.txt
+      - uses: game-ci/unity-builder@v4
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        with:
+          projectPath: example/unity-project
+          targetPlatform: WebGL
+          buildName: unity
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unity-webgl-build
+          path: build/WebGL/unity
+
+  angular-build:
+    name: Angular Build & Test
+    needs: unity-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: example/angular-unity-example/package-lock.json
+
+      # Download the Unity WebGL build into the Angular public directory
+      - uses: actions/download-artifact@v4
+        with:
+          name: unity-webgl-build
+          path: example/angular-unity-example/public/unity
+
+      - name: Install dependencies
+        working-directory: example/angular-unity-example
+        run: npm ci
+
+      - name: Build
+        working-directory: example/angular-unity-example
+        run: npx ng build
+
+      - name: Test
+        working-directory: example/angular-unity-example
+        run: npx ng test --watch=false
