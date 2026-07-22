@@ -14,9 +14,12 @@ namespace UnityAngularBridge
     {
         private const string UnityClientPathKey = "UnityAngularBridge_UnityClientOutputPath";
         private const string JSLibServicePathKey = "UnityAngularBridge_JSLibServiceOutputPath";
+        private const string IUnityInstanceImportKey = "UnityAngularBridge_IUnityInstanceImportPath";
+        private const string DefaultIUnityInstanceImport = "ngx-unity";
 
         private string _unityClientOutputPath = string.Empty;
         private string _jsLibServiceOutputPath = string.Empty;
+        private string _iUnityInstanceImportPath = DefaultIUnityInstanceImport;
 
         [MenuItem("Tools/UnityAngularBridge/Settings")]
         public static void ShowWindow()
@@ -28,6 +31,7 @@ namespace UnityAngularBridge
         {
             _unityClientOutputPath = EditorPrefs.GetString(UnityClientPathKey, string.Empty);
             _jsLibServiceOutputPath = EditorPrefs.GetString(JSLibServicePathKey, string.Empty);
+            _iUnityInstanceImportPath = EditorPrefs.GetString(IUnityInstanceImportKey, DefaultIUnityInstanceImport);
         }
 
         private void OnGUI()
@@ -76,12 +80,22 @@ namespace UnityAngularBridge
             EditorGUILayout.EndHorizontal();
 
             EditorGUILayout.Space();
+
+            // IUnityInstance import path
+            EditorGUILayout.LabelField("IUnityInstance Import Path");
+            EditorGUILayout.LabelField(
+                "Default: ngx-unity. Import path for IUnityInstance in unity-client.ts. Leave empty to emit an inline interface.",
+                EditorStyles.miniLabel);
+            _iUnityInstanceImportPath = EditorGUILayout.TextField(_iUnityInstanceImportPath);
+
+            EditorGUILayout.Space();
             EditorGUILayout.Space();
 
             if (GUILayout.Button("Save Settings"))
             {
                 EditorPrefs.SetString(UnityClientPathKey, _unityClientOutputPath);
                 EditorPrefs.SetString(JSLibServicePathKey, _jsLibServiceOutputPath);
+                EditorPrefs.SetString(IUnityInstanceImportKey, _iUnityInstanceImportPath);
                 EditorUtility.DisplayDialog("UnityAngularBridge", "Settings saved. Recompile or press Play to regenerate files.", "OK");
             }
 
@@ -89,8 +103,10 @@ namespace UnityAngularBridge
             {
                 _unityClientOutputPath = string.Empty;
                 _jsLibServiceOutputPath = string.Empty;
+                _iUnityInstanceImportPath = DefaultIUnityInstanceImport;
                 EditorPrefs.DeleteKey(UnityClientPathKey);
                 EditorPrefs.DeleteKey(JSLibServicePathKey);
+                EditorPrefs.DeleteKey(IUnityInstanceImportKey);
             }
         }
 
@@ -136,6 +152,15 @@ namespace UnityAngularBridge
                 return custom;
             }
             return GetPluginsPath();
+        }
+
+        /// <summary>
+        /// Gets the module path IUnityInstance is imported from in the generated unity-client.ts.
+        /// Empty string means "emit an inline interface" (for consumers not using ngx-unity).
+        /// </summary>
+        public static string GetIUnityInstanceImportPath()
+        {
+            return EditorPrefs.GetString(IUnityInstanceImportKey, DefaultIUnityInstanceImport);
         }
 
         private static string GetPluginsPath()

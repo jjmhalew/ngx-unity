@@ -46,6 +46,11 @@ namespace UnityAngularBridge.Models
         /// Only relevant when CallbackType is not None.
         /// </summary>
         public bool CallbackHasStringParam { get; set; }
+
+        /// <summary>
+        /// DTO type for JSON-serialized payloads. Only set when ReturnType is Json.
+        /// </summary>
+        public System.Type JsonType { get; set; }
     }
 
     /// <summary>
@@ -67,6 +72,11 @@ namespace UnityAngularBridge.Models
         /// string[].
         /// </summary>
         StringArray,
+
+        /// <summary>
+        /// JSON-serialized DTO, typed via JSLibVariable.JsonType.
+        /// </summary>
+        Json,
     }
 
     /// <summary>

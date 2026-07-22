@@ -8,37 +8,103 @@
 
 import { Injectable, signal, WritableSignal, Signal } from "@angular/core";
 
+export interface SceneState {
+  selectedObjectId: string;
+  objectCount: number;
+  visible: boolean;
+}
+
 // Module-scope writable signals (accessed by window callbacks below).
 const sendSelectedObjectSignal: WritableSignal<string | null> = signal<string | null>(null, { equal: () => false });
 const sendSceneReadySignal: WritableSignal<number> = signal<number>(0);
 const sendObjectsListSignal: WritableSignal<string[]> = signal<string[]>([], { equal: () => false });
+const sendSceneStateSignal: WritableSignal<SceneState | null> = signal<SceneState | null>(null, { equal: () => false });
 
 // Module-scope callback holders.
 let requestDataFromWebHandler: ((query: string, respond: (result: string) => void) => void) | null = null;
 let registerOnNavigationChangedCallback: ((data: string) => void) | null = null;
 
+/** Per-instance signal set and callback holders, keyed by the Unity canvas DOM id. */
+export class UnityJSLibInstanceChannel {
+  readonly sendSelectedObjectSignal: WritableSignal<string | null> = signal<string | null>(null, { equal: () => false });
+  readonly sendSelectedObject: Signal<string | null> = this.sendSelectedObjectSignal.asReadonly();
+  readonly sendSceneReadySignal: WritableSignal<number> = signal<number>(0);
+  readonly sendSceneReady: Signal<number> = this.sendSceneReadySignal.asReadonly();
+  readonly sendObjectsListSignal: WritableSignal<string[]> = signal<string[]>([], { equal: () => false });
+  readonly sendObjectsList: Signal<string[]> = this.sendObjectsListSignal.asReadonly();
+  readonly sendSceneStateSignal: WritableSignal<SceneState | null> = signal<SceneState | null>(null, { equal: () => false });
+  readonly sendSceneState: Signal<SceneState | null> = this.sendSceneStateSignal.asReadonly();
+
+  requestDataFromWebHandler: ((query: string, respond: (result: string) => void) => void) | null = null;
+  registerOnNavigationChangedCallback: ((data: string) => void) | null = null;
+
+  /** Register a handler for RequestDataFromWeb requests from this instance. */
+  registerRequestDataFromWebHandler(handler: (query: string, respond: (result: string) => void) => void): void {
+    this.requestDataFromWebHandler = handler;
+  }
+
+  /** Invoke the callback registered by Unity via RegisterOnNavigationChanged for this instance. */
+  notifyOnNavigationChanged(data: string): void {
+    this.registerOnNavigationChangedCallback?.(data);
+  }
+}
+
+const channels = new Map<string, UnityJSLibInstanceChannel>();
+
+function getOrCreateChannel(instanceId: string): UnityJSLibInstanceChannel {
+  let channel = channels.get(instanceId);
+  if (!channel) {
+    channel = new UnityJSLibInstanceChannel();
+    channels.set(instanceId, channel);
+  }
+  return channel;
+}
+
 // Register window callbacks invoked by Unity's jslib.
+// The trailing instanceId is appended by the generated jslib (Unity canvas id);
+// calls without it (older jslib builds) are routed to the "default" channel.
 /* eslint-disable @typescript-eslint/no-explicit-any */
-(window as any)["sendSelectedObjectFromUnity"] = (objectId: string): void => {
+(window as any)["sendSelectedObjectFromUnity"] = (objectId: string, instanceId?: string): void => {
   sendSelectedObjectSignal.set(objectId);
+  getOrCreateChannel(instanceId ?? "default").sendSelectedObjectSignal.set(objectId);
 };
-(window as any)["sendSceneReadyFromUnity"] = (): void => {
+(window as any)["sendSceneReadyFromUnity"] = (instanceId?: string): void => {
   sendSceneReadySignal.update(v => v + 1);
+  getOrCreateChannel(instanceId ?? "default").sendSceneReadySignal.update(v => v + 1);
 };
-(window as any)["sendObjectsListFromUnity"] = (objectIds: string): void => {
-  sendObjectsListSignal.set(objectIds.split("|"));
+(window as any)["sendObjectsListFromUnity"] = (objectIds: string, instanceId?: string): void => {
+  const values = objectIds === "" ? [] : objectIds.split("|");
+  sendObjectsListSignal.set(values);
+  getOrCreateChannel(instanceId ?? "default").sendObjectsListSignal.set(values);
 };
-(window as any)["requestDataFromWebFromUnity"] = (query: string, respond: (result: string) => void): void => {
-  requestDataFromWebHandler?.(query, respond);
+(window as any)["sendSceneStateFromUnity"] = (json: string, instanceId?: string): void => {
+  try {
+    const value = JSON.parse(json) as SceneState;
+    sendSceneStateSignal.set(value);
+    getOrCreateChannel(instanceId ?? "default").sendSceneStateSignal.set(value);
+  } catch (e) {
+    console.error("[UnityAngularBridge] Failed to parse SendSceneState JSON:", e);
+  }
 };
-(window as any)["registerOnNavigationChangedFromUnity"] = (handler: (data: string) => void): void => {
+(window as any)["requestDataFromWebFromUnity"] = (query: string, respond: (result: string) => void, instanceId?: string): void => {
+  const channelHandler = channels.get(instanceId ?? "default")?.requestDataFromWebHandler;
+  if (channelHandler) {
+    channelHandler(query, respond);
+  } else {
+    requestDataFromWebHandler?.(query, respond);
+  }
+};
+(window as any)["registerOnNavigationChangedFromUnity"] = (handler: (data: string) => void, instanceId?: string): void => {
   registerOnNavigationChangedCallback = handler;
+  getOrCreateChannel(instanceId ?? "default").registerOnNavigationChangedCallback = handler;
 };
 
 /**
  * Auto-generated service for Unity → Angular communication.
  * Signals are updated when Unity calls the corresponding jslib functions.
  * Register callback handlers to respond to Unity requests.
+ * The flat signals reflect the last event from any instance; use forInstance()
+ * to observe a single Unity instance when multiple viewports are on the page.
  * See: https://docs.unity3d.com/Manual/webgl-interactingwithbrowserscripting.html
  */
 @Injectable({
@@ -47,18 +113,29 @@ let registerOnNavigationChangedCallback: ((data: string) => void) | null = null;
 export class UnityJSLibExportedService {
   /** Sends the currently selected object ID to Angular. */
   readonly sendSelectedObject: Signal<string | null> = sendSelectedObjectSignal.asReadonly();
-  /** Notifies Angular that the scene has finished loading. Increments on each event. */
+  /** Notifies Angular that the scene has finished loading. */
   readonly sendSceneReady: Signal<number> = sendSceneReadySignal.asReadonly();
   /** Sends a pipe-delimited list of object IDs to Angular (split into string[]). */
   readonly sendObjectsList: Signal<string[]> = sendObjectsListSignal.asReadonly();
+  /** Sends the current scene state to Angular as a typed JSON object. */
+  readonly sendSceneState: Signal<SceneState | null> = sendSceneStateSignal.asReadonly();
 
-  /** Requests data from the web page. Angular processes the query and responds via callback. */
+  /** Per-instance view of the Unity → Angular channels, keyed by the Unity canvas DOM id. */
+  forInstance(instanceId: string): UnityJSLibInstanceChannel {
+    return getOrCreateChannel(instanceId);
+  }
+
+  /** Requests data from the web page. Angular processes the query and responds via callback. Used for any instance without its own forInstance() handler. */
   registerRequestDataFromWebHandler(handler: (query: string, respond: (result: string) => void) => void): void {
     requestDataFromWebHandler = handler;
   }
 
-  /** Registers a callback that Angular can invoke to notify Unity of navigation changes. */
+  /** Registers a callback that Angular can invoke to notify Unity of navigation changes. Broadcasts to all instances; use forInstance() to target one. */
   notifyOnNavigationChanged(data: string): void {
-    registerOnNavigationChangedCallback?.(data);
+    if (channels.size > 0) {
+      channels.forEach((channel) => channel.registerOnNavigationChangedCallback?.(data));
+    } else {
+      registerOnNavigationChangedCallback?.(data);
+    }
   }
 }

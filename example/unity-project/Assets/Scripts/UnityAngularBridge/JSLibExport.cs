@@ -7,7 +7,6 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
-using System.Xml.Linq;
 using UnityAngularBridge.Models;
 using UnityEditor;
 using UnityEngine;
@@ -22,7 +21,10 @@ namespace UnityAngularBridge
     /// Supports:
     /// - String/void parameters → Angular signals
     /// - [JSLibExport(IsStringArray = true)] → string[] signals
+    /// - [JSLibExport(JsonType = typeof(MyDto))] → typed DTO signals via JSON.parse
     /// - Action/Action&lt;string&gt; callback parameters → request-response or registration patterns
+    /// - Multi-instance routing: the jslib passes the Unity canvas id so Angular can key
+    ///   signals per instance (UnityJSLibExportedService.forInstance)
     /// - XML doc comments → TSDoc in generated TypeScript
     /// - Configurable output paths via Tools &gt; UnityAngularBridge &gt; Settings
     /// </summary>
@@ -35,56 +37,44 @@ namespace UnityAngularBridge
         private static readonly List<JSLibVariable> _jSLibVariables = new();
         private static readonly Dictionary<string, string> _xmlDocs = new();
 
+        /// <summary>
+        /// Emitted at the top of every jslib function body. Unity's loader assigns the target
+        /// canvas to the Emscripten Module, so its DOM id identifies the instance.
+        /// </summary>
+        private const string InstanceIdLine =
+            "var instanceId = (typeof Module !== 'undefined' && Module['canvas'] && Module['canvas'].id) || 'default';";
+
         static JSLibExport()
         {
-            LoadXmlDocumentation();
-            ScanMethods();
-            GenerateJSLib();
-            GenerateJSLibClient();
-        }
-
-        #region XmlDocumentation
-
-        private static void LoadXmlDocumentation()
-        {
-            _xmlDocs.Clear();
             try
             {
-                string xmlPath = Path.Combine(Application.dataPath, "..", "Library", "ScriptAssemblies", "Assembly-CSharp.xml");
-                if (!File.Exists(xmlPath)) return;
-
-                XDocument doc = XDocument.Load(xmlPath);
-                foreach (var member in doc.Descendants("member"))
-                {
-                    string? name = member.Attribute("name")?.Value;
-                    string? summary = member.Element("summary")?.Value;
-                    if (!string.IsNullOrEmpty(name) && !string.IsNullOrEmpty(summary))
-                    {
-                        string cleaned = summary.Trim().Replace("\r\n", " ").Replace("\n", " ");
-                        while (cleaned.Contains("  "))
-                            cleaned = cleaned.Replace("  ", " ");
-                        _xmlDocs[name] = cleaned;
-                    }
-                }
+                BridgeGeneratorUtilities.LoadXmlDocumentation(_xmlDocs);
+                ScanMethods();
             }
             catch (Exception e)
             {
-                Debug.LogWarning($"[UnityAngularBridge] Could not load XML documentation: {e.Message}");
+                Debug.LogError($"[UnityAngularBridge] Scanning [DllImport] methods failed: {e}");
+                return;
+            }
+
+            try
+            {
+                GenerateJSLib();
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"[UnityAngularBridge] {_jsLibFileName} generation failed: {e}");
+            }
+
+            try
+            {
+                GenerateJSLibClient();
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"[UnityAngularBridge] {_jsLibClientFileName} generation failed: {e}");
             }
         }
-
-        private static string GetXmlDocumentation(Type type, MethodInfo methodInfo)
-        {
-            string paramTypes = string.Join(",",
-                methodInfo.GetParameters().Select(p => p.ParameterType.FullName ?? p.ParameterType.Name));
-            string memberName = methodInfo.GetParameters().Length > 0
-                ? $"M:{type.FullName}.{methodInfo.Name}({paramTypes})"
-                : $"M:{type.FullName}.{methodInfo.Name}";
-
-            return _xmlDocs.TryGetValue(memberName, out string? doc) ? doc : string.Empty;
-        }
-
-        #endregion
 
         #region Scanning
 
@@ -114,7 +104,7 @@ namespace UnityAngularBridge
                     string attrDoc = jsLibExportAttr?.Documentation ?? string.Empty;
                     variable.MethodDocumentation = !string.IsNullOrEmpty(attrDoc)
                         ? attrDoc
-                        : GetXmlDocumentation(type, methodInfo);
+                        : BridgeGeneratorUtilities.GetXmlDocumentation(_xmlDocs, type, methodInfo);
 
                     variable.Category = jsLibExportAttr?.Category ?? string.Empty;
 
@@ -148,6 +138,27 @@ namespace UnityAngularBridge
                         }
                     }
 
+                    Type? jsonType = jsLibExportAttr?.JsonType;
+                    if (jsonType != null)
+                    {
+                        if (jsLibExportAttr!.IsStringArray)
+                        {
+                            throw new InvalidOperationException(
+                                $"[UnityAngularBridge] {methodInfo.Name}: JsonType and IsStringArray are mutually exclusive.");
+                        }
+                        if (hasCallback)
+                        {
+                            throw new InvalidOperationException(
+                                $"[UnityAngularBridge] {methodInfo.Name}: JsonType is not supported on callback methods.");
+                        }
+                        if (string.IsNullOrEmpty(dataParamName))
+                        {
+                            throw new InvalidOperationException(
+                                $"[UnityAngularBridge] {methodInfo.Name}: JsonType requires a single string parameter " +
+                                "(pass JsonUtility.ToJson(obj) at the call site).");
+                        }
+                    }
+
                     if (hasCallback)
                     {
                         variable.CallbackType = jsLibExportAttr?.IsCallbackRegistration == true
@@ -156,6 +167,13 @@ namespace UnityAngularBridge
                         variable.CallbackHasStringParam = callbackHasStringParam;
                         variable.ParameterName = dataParamName;
                         variable.ReturnType = ReturnType.Void;
+                    }
+                    else if (jsonType != null)
+                    {
+                        variable.ParameterName = dataParamName;
+                        variable.ReturnType = ReturnType.Json;
+                        variable.JsonType = jsonType;
+                        variable.DefaultValue = "null";
                     }
                     else if (!string.IsNullOrEmpty(dataParamName))
                     {
@@ -191,26 +209,29 @@ namespace UnityAngularBridge
 
         private static void GenerateJSLib()
         {
-            using IndentedTextWriter writer = new(
-                new StreamWriter(Path.Combine(GetPluginsPath(), _jsLibFileName)) { AutoFlush = true },
-                _tabString);
-
-            writer.WriteLine("mergeInto(LibraryManager.library, {");
-            writer.Indent++;
-
-            foreach (JSLibVariable variable in _jSLibVariables)
+            using StringWriter stringWriter = new();
+            using (IndentedTextWriter writer = new(stringWriter, _tabString))
             {
-                WriteJSLibMethod(writer, variable);
+                writer.WriteLine("mergeInto(LibraryManager.library, {");
+                writer.Indent++;
+
+                foreach (JSLibVariable variable in _jSLibVariables)
+                {
+                    WriteJSLibMethod(writer, variable);
+                }
+
+                writer.Indent--;
+                writer.WriteLine("});");
             }
 
-            writer.Indent--;
-            writer.WriteLine("});");
+            BridgeGeneratorUtilities.WriteFileIfChanged(
+                Path.Combine(GetPluginsPath(), _jsLibFileName), stringWriter.ToString());
         }
 
         private static void WriteJSLibMethod(IndentedTextWriter writer, JSLibVariable variable)
         {
             string methodName = variable.MethodName;
-            string windowFnName = $"{FirstCharToLowerCase(methodName)}FromUnity";
+            string windowFnName = $"{BridgeGeneratorUtilities.FirstCharToLowerCase(methodName)}FromUnity";
             bool hasDataParam = !string.IsNullOrEmpty(variable.ParameterName);
 
             if (variable.CallbackType == CallbackType.RequestResponse)
@@ -220,12 +241,14 @@ namespace UnityAngularBridge
                 {
                     writer.WriteLine($"{methodName}: function ({variable.ParameterName}Ptr, callbackPtr)" + " {");
                     writer.Indent++;
+                    writer.WriteLine(InstanceIdLine);
                     writer.WriteLine($"var {variable.ParameterName} = UTF8ToString({variable.ParameterName}Ptr);");
                 }
                 else
                 {
                     writer.WriteLine($"{methodName}: function (callbackPtr)" + " {");
                     writer.Indent++;
+                    writer.WriteLine(InstanceIdLine);
                 }
 
                 if (variable.CallbackHasStringParam)
@@ -239,7 +262,7 @@ namespace UnityAngularBridge
                     writer.WriteLine("{{{ makeDynCall('vi', 'callbackPtr') }}}(buffer);");
                     writer.WriteLine("_free(buffer);");
                     writer.Indent--;
-                    writer.WriteLine("});");
+                    writer.WriteLine("}, instanceId);");
                 }
                 else
                 {
@@ -248,7 +271,7 @@ namespace UnityAngularBridge
                     writer.Indent++;
                     writer.WriteLine("{{{ makeDynCall('v', 'callbackPtr') }}}();");
                     writer.Indent--;
-                    writer.WriteLine("});");
+                    writer.WriteLine("}, instanceId);");
                 }
 
                 writer.Indent--;
@@ -260,6 +283,7 @@ namespace UnityAngularBridge
                 // Registration: Unity passes a C# callback pointer, JS wraps it for Angular to call later
                 writer.WriteLine($"{methodName}: function (callbackPtr)" + " {");
                 writer.Indent++;
+                writer.WriteLine(InstanceIdLine);
 
                 if (variable.CallbackHasStringParam)
                 {
@@ -271,7 +295,7 @@ namespace UnityAngularBridge
                     writer.WriteLine("{{{ makeDynCall('vi', 'callbackPtr') }}}(buffer);");
                     writer.WriteLine("_free(buffer);");
                     writer.Indent--;
-                    writer.WriteLine("});");
+                    writer.WriteLine("}, instanceId);");
                 }
                 else
                 {
@@ -279,7 +303,7 @@ namespace UnityAngularBridge
                     writer.Indent++;
                     writer.WriteLine("{{{ makeDynCall('v', 'callbackPtr') }}}();");
                     writer.Indent--;
-                    writer.WriteLine("});");
+                    writer.WriteLine("}, instanceId);");
                 }
 
                 writer.Indent--;
@@ -291,7 +315,8 @@ namespace UnityAngularBridge
                 // Regular method with string parameter
                 writer.WriteLine($"{methodName}: function ({variable.ParameterName}, size)" + " {");
                 writer.Indent++;
-                writer.WriteLine($"window.{windowFnName}(UTF8ToString({variable.ParameterName}));");
+                writer.WriteLine(InstanceIdLine);
+                writer.WriteLine($"window.{windowFnName}(UTF8ToString({variable.ParameterName}), instanceId);");
                 writer.Indent--;
                 writer.WriteLine("},");
                 writer.WriteLine();
@@ -301,7 +326,8 @@ namespace UnityAngularBridge
                 // No parameter method
                 writer.WriteLine($"{methodName}: function ()" + " {");
                 writer.Indent++;
-                writer.WriteLine($"window.{windowFnName}();");
+                writer.WriteLine(InstanceIdLine);
+                writer.WriteLine($"window.{windowFnName}(instanceId);");
                 writer.Indent--;
                 writer.WriteLine("},");
                 writer.WriteLine();
@@ -314,17 +340,24 @@ namespace UnityAngularBridge
 
         private static void GenerateJSLibClient()
         {
-            string outputPath = UnityAngularBridgeSettings.GetJSLibServiceOutputPath();
-            using IndentedTextWriter writer = new(
-                new StreamWriter(Path.Combine(outputPath, _jsLibClientFileName)) { AutoFlush = true },
-                _tabString);
+            using StringWriter stringWriter = new();
+            using (IndentedTextWriter writer = new(stringWriter, _tabString))
+            {
+                WriteAutoGeneratedHeader(writer);
+                WriteImports(writer);
+                TypeScriptInterfaceGenerator.WriteInterfaces(
+                    writer,
+                    _jSLibVariables.Where(v => v.JsonType != null).Select(v => v.JsonType).Distinct());
+                WriteModuleScopeSignals(writer);
+                WriteModuleScopeCallbackHolders(writer);
+                WriteInstanceChannel(writer);
+                WriteWindowCallbacks(writer);
+                WriteServiceClass(writer);
+            }
 
-            WriteAutoGeneratedHeader(writer);
-            WriteImports(writer);
-            WriteModuleScopeSignals(writer);
-            WriteModuleScopeCallbackHolders(writer);
-            WriteWindowCallbacks(writer);
-            WriteServiceClass(writer);
+            string outputPath = UnityAngularBridgeSettings.GetJSLibServiceOutputPath();
+            BridgeGeneratorUtilities.WriteFileIfChanged(
+                Path.Combine(outputPath, _jsLibClientFileName), stringWriter.ToString());
         }
 
         private static void WriteAutoGeneratedHeader(IndentedTextWriter writer)
@@ -345,6 +378,50 @@ namespace UnityAngularBridge
             writer.WriteLine();
         }
 
+        private static string GetSignalTsType(JSLibVariable variable)
+        {
+            return variable.ReturnType switch
+            {
+                ReturnType.Void => "number",
+                ReturnType.String => "string | null",
+                ReturnType.StringArray => "string[]",
+                ReturnType.Json => $"{variable.JsonType.Name} | null",
+                _ => "unknown",
+            };
+        }
+
+        private static string GetSignalInitializer(JSLibVariable variable)
+        {
+            return variable.ReturnType == ReturnType.Void
+                ? "signal<number>(0)"
+                : $"signal<{GetSignalTsType(variable)}>({variable.DefaultValue}, {{ equal: () => false }})";
+        }
+
+        /// <summary>
+        /// Handler signature for RequestResponse variables, e.g.
+        /// "(query: string, respond: (result: string) =&gt; void) =&gt; void".
+        /// </summary>
+        private static string GetRequestResponseHandlerSignature(JSLibVariable variable)
+        {
+            bool hasData = !string.IsNullOrEmpty(variable.ParameterName);
+            string respond = variable.CallbackHasStringParam
+                ? "respond: (result: string) => void"
+                : "respond: () => void";
+            return hasData ? $"(query: string, {respond}) => void" : $"({respond}) => void";
+        }
+
+        private static string GetRegistrationCallbackSignature(JSLibVariable variable)
+        {
+            return variable.CallbackHasStringParam ? "(data: string) => void" : "() => void";
+        }
+
+        private static string GetRegistrationBaseName(JSLibVariable variable)
+        {
+            return variable.MethodName.StartsWith("Register")
+                ? variable.MethodName.Substring("Register".Length)
+                : variable.MethodName;
+        }
+
         private static void WriteModuleScopeSignals(IndentedTextWriter writer)
         {
             var signalVars = _jSLibVariables.Where(v => v.CallbackType == CallbackType.None).ToList();
@@ -353,19 +430,8 @@ namespace UnityAngularBridge
             writer.WriteLine("// Module-scope writable signals (accessed by window callbacks below).");
             foreach (JSLibVariable variable in signalVars)
             {
-                string name = $"{FirstCharToLowerCase(variable.MethodName)}Signal";
-                switch (variable.ReturnType)
-                {
-                    case ReturnType.Void:
-                        writer.WriteLine($"const {name}: WritableSignal<number> = signal<number>(0);");
-                        break;
-                    case ReturnType.String:
-                        writer.WriteLine($"const {name}: WritableSignal<string | null> = signal<string | null>({variable.DefaultValue}, {{ equal: () => false }});");
-                        break;
-                    case ReturnType.StringArray:
-                        writer.WriteLine($"const {name}: WritableSignal<string[]> = signal<string[]>({variable.DefaultValue}, {{ equal: () => false }});");
-                        break;
-                }
+                string name = $"{BridgeGeneratorUtilities.FirstCharToLowerCase(variable.MethodName)}Signal";
+                writer.WriteLine($"const {name}: WritableSignal<{GetSignalTsType(variable)}> = {GetSignalInitializer(variable)};");
             }
             writer.WriteLine();
         }
@@ -378,113 +444,197 @@ namespace UnityAngularBridge
             writer.WriteLine("// Module-scope callback holders.");
             foreach (JSLibVariable variable in callbackVars)
             {
-                string name = FirstCharToLowerCase(variable.MethodName)!;
-                bool hasData = !string.IsNullOrEmpty(variable.ParameterName);
+                string name = BridgeGeneratorUtilities.FirstCharToLowerCase(variable.MethodName)!;
 
                 if (variable.CallbackType == CallbackType.RequestResponse)
                 {
-                    if (hasData && variable.CallbackHasStringParam)
-                        writer.WriteLine($"let {name}Handler: ((query: string, respond: (result: string) => void) => void) | null = null;");
-                    else if (hasData)
-                        writer.WriteLine($"let {name}Handler: ((query: string, respond: () => void) => void) | null = null;");
-                    else if (variable.CallbackHasStringParam)
-                        writer.WriteLine($"let {name}Handler: ((respond: (result: string) => void) => void) | null = null;");
-                    else
-                        writer.WriteLine($"let {name}Handler: ((respond: () => void) => void) | null = null;");
+                    writer.WriteLine($"let {name}Handler: ({GetRequestResponseHandlerSignature(variable)}) | null = null;");
                 }
                 else // Registration
                 {
-                    if (variable.CallbackHasStringParam)
-                        writer.WriteLine($"let {name}Callback: ((data: string) => void) | null = null;");
-                    else
-                        writer.WriteLine($"let {name}Callback: (() => void) | null = null;");
+                    writer.WriteLine($"let {name}Callback: ({GetRegistrationCallbackSignature(variable)}) | null = null;");
                 }
             }
+            writer.WriteLine();
+        }
+
+        private static void WriteInstanceChannel(IndentedTextWriter writer)
+        {
+            var signalVars = _jSLibVariables.Where(v => v.CallbackType == CallbackType.None).ToList();
+            var callbackVars = _jSLibVariables.Where(v => v.CallbackType != CallbackType.None).ToList();
+
+            writer.WriteLine("/** Per-instance signal set and callback holders, keyed by the Unity canvas DOM id. */");
+            writer.WriteLine("export class UnityJSLibInstanceChannel {");
+            writer.Indent++;
+
+            foreach (JSLibVariable variable in signalVars)
+            {
+                string name = BridgeGeneratorUtilities.FirstCharToLowerCase(variable.MethodName)!;
+                string tsType = GetSignalTsType(variable);
+                writer.WriteLine($"readonly {name}Signal: WritableSignal<{tsType}> = {GetSignalInitializer(variable)};");
+                writer.WriteLine($"readonly {name}: Signal<{tsType}> = this.{name}Signal.asReadonly();");
+            }
+
+            if (callbackVars.Any())
+            {
+                writer.WriteLine();
+                foreach (JSLibVariable variable in callbackVars)
+                {
+                    string name = BridgeGeneratorUtilities.FirstCharToLowerCase(variable.MethodName)!;
+
+                    if (variable.CallbackType == CallbackType.RequestResponse)
+                    {
+                        writer.WriteLine($"{name}Handler: ({GetRequestResponseHandlerSignature(variable)}) | null = null;");
+                    }
+                    else // Registration
+                    {
+                        writer.WriteLine($"{name}Callback: ({GetRegistrationCallbackSignature(variable)}) | null = null;");
+                    }
+                }
+
+                foreach (JSLibVariable variable in callbackVars)
+                {
+                    string name = BridgeGeneratorUtilities.FirstCharToLowerCase(variable.MethodName)!;
+                    writer.WriteLine();
+
+                    if (variable.CallbackType == CallbackType.RequestResponse)
+                    {
+                        writer.WriteLine($"/** Register a handler for {variable.MethodName} requests from this instance. */");
+                        writer.WriteLine($"register{variable.MethodName}Handler(handler: {GetRequestResponseHandlerSignature(variable)}): void {{");
+                        writer.Indent++;
+                        writer.WriteLine($"this.{name}Handler = handler;");
+                        writer.Indent--;
+                        writer.WriteLine("}");
+                    }
+                    else // Registration
+                    {
+                        string baseName = GetRegistrationBaseName(variable);
+                        writer.WriteLine($"/** Invoke the callback registered by Unity via {variable.MethodName} for this instance. */");
+                        if (variable.CallbackHasStringParam)
+                        {
+                            writer.WriteLine($"notify{baseName}(data: string): void {{");
+                            writer.Indent++;
+                            writer.WriteLine($"this.{name}Callback?.(data);");
+                        }
+                        else
+                        {
+                            writer.WriteLine($"notify{baseName}(): void {{");
+                            writer.Indent++;
+                            writer.WriteLine($"this.{name}Callback?.();");
+                        }
+                        writer.Indent--;
+                        writer.WriteLine("}");
+                    }
+                }
+            }
+
+            writer.Indent--;
+            writer.WriteLine("}");
+            writer.WriteLine();
+            writer.WriteLine("const channels = new Map<string, UnityJSLibInstanceChannel>();");
+            writer.WriteLine();
+            writer.WriteLine("function getOrCreateChannel(instanceId: string): UnityJSLibInstanceChannel {");
+            writer.Indent++;
+            writer.WriteLine("let channel = channels.get(instanceId);");
+            writer.WriteLine("if (!channel) {");
+            writer.Indent++;
+            writer.WriteLine("channel = new UnityJSLibInstanceChannel();");
+            writer.WriteLine("channels.set(instanceId, channel);");
+            writer.Indent--;
+            writer.WriteLine("}");
+            writer.WriteLine("return channel;");
+            writer.Indent--;
+            writer.WriteLine("}");
             writer.WriteLine();
         }
 
         private static void WriteWindowCallbacks(IndentedTextWriter writer)
         {
             writer.WriteLine("// Register window callbacks invoked by Unity's jslib.");
+            writer.WriteLine("// The trailing instanceId is appended by the generated jslib (Unity canvas id);");
+            writer.WriteLine("// calls without it (older jslib builds) are routed to the \"default\" channel.");
             writer.WriteLine("/* eslint-disable @typescript-eslint/no-explicit-any */");
 
             foreach (JSLibVariable variable in _jSLibVariables)
             {
-                string methodNameLower = FirstCharToLowerCase(variable.MethodName)!;
+                string methodNameLower = BridgeGeneratorUtilities.FirstCharToLowerCase(variable.MethodName)!;
                 string windowFnName = $"{methodNameLower}FromUnity";
 
                 if (variable.CallbackType == CallbackType.RequestResponse)
                 {
                     bool hasData = !string.IsNullOrEmpty(variable.ParameterName);
-                    string paramNameLower = hasData ? FirstCharToLowerCase(variable.ParameterName)! : "";
+                    string paramNameLower = hasData ? BridgeGeneratorUtilities.FirstCharToLowerCase(variable.ParameterName)! : "";
+                    string respondType = variable.CallbackHasStringParam ? "(result: string) => void" : "() => void";
+                    string handlerArgs = hasData ? $"{paramNameLower}, respond" : "respond";
+                    string fnParams = hasData
+                        ? $"{paramNameLower}: string, respond: {respondType}, instanceId?: string"
+                        : $"respond: {respondType}, instanceId?: string";
 
-                    if (hasData && variable.CallbackHasStringParam)
-                    {
-                        writer.WriteLine($"(window as any)[\"{windowFnName}\"] = ({paramNameLower}: string, respond: (result: string) => void): void => {{");
-                        writer.Indent++;
-                        writer.WriteLine($"{methodNameLower}Handler?.({paramNameLower}, respond);");
-                    }
-                    else if (hasData)
-                    {
-                        writer.WriteLine($"(window as any)[\"{windowFnName}\"] = ({paramNameLower}: string, respond: () => void): void => {{");
-                        writer.Indent++;
-                        writer.WriteLine($"{methodNameLower}Handler?.({paramNameLower}, respond);");
-                    }
-                    else if (variable.CallbackHasStringParam)
-                    {
-                        writer.WriteLine($"(window as any)[\"{windowFnName}\"] = (respond: (result: string) => void): void => {{");
-                        writer.Indent++;
-                        writer.WriteLine($"{methodNameLower}Handler?.(respond);");
-                    }
-                    else
-                    {
-                        writer.WriteLine($"(window as any)[\"{windowFnName}\"] = (respond: () => void): void => {{");
-                        writer.Indent++;
-                        writer.WriteLine($"{methodNameLower}Handler?.(respond);");
-                    }
+                    writer.WriteLine($"(window as any)[\"{windowFnName}\"] = ({fnParams}): void => {{");
+                    writer.Indent++;
+                    writer.WriteLine($"const channelHandler = channels.get(instanceId ?? \"default\")?.{methodNameLower}Handler;");
+                    writer.WriteLine("if (channelHandler) {");
+                    writer.Indent++;
+                    writer.WriteLine($"channelHandler({handlerArgs});");
+                    writer.Indent--;
+                    writer.WriteLine("} else {");
+                    writer.Indent++;
+                    writer.WriteLine($"{methodNameLower}Handler?.({handlerArgs});");
+                    writer.Indent--;
+                    writer.WriteLine("}");
                     writer.Indent--;
                     writer.WriteLine("};");
                 }
                 else if (variable.CallbackType == CallbackType.Registration)
                 {
-                    if (variable.CallbackHasStringParam)
-                    {
-                        writer.WriteLine($"(window as any)[\"{windowFnName}\"] = (handler: (data: string) => void): void => {{");
-                        writer.Indent++;
-                        writer.WriteLine($"{methodNameLower}Callback = handler;");
-                    }
-                    else
-                    {
-                        writer.WriteLine($"(window as any)[\"{windowFnName}\"] = (handler: () => void): void => {{");
-                        writer.Indent++;
-                        writer.WriteLine($"{methodNameLower}Callback = handler;");
-                    }
+                    writer.WriteLine($"(window as any)[\"{windowFnName}\"] = (handler: {GetRegistrationCallbackSignature(variable)}, instanceId?: string): void => {{");
+                    writer.Indent++;
+                    writer.WriteLine($"{methodNameLower}Callback = handler;");
+                    writer.WriteLine($"getOrCreateChannel(instanceId ?? \"default\").{methodNameLower}Callback = handler;");
                     writer.Indent--;
                     writer.WriteLine("};");
                 }
                 else if (!string.IsNullOrEmpty(variable.ParameterName))
                 {
-                    string paramNameLower = FirstCharToLowerCase(variable.ParameterName)!;
+                    string paramNameLower = BridgeGeneratorUtilities.FirstCharToLowerCase(variable.ParameterName)!;
+                    writer.WriteLine($"(window as any)[\"{windowFnName}\"] = ({paramNameLower}: string, instanceId?: string): void => {{");
+                    writer.Indent++;
+
                     if (variable.ReturnType == ReturnType.StringArray)
                     {
-                        writer.WriteLine($"(window as any)[\"{windowFnName}\"] = ({paramNameLower}: string): void => {{");
+                        writer.WriteLine($"const values = {paramNameLower} === \"\" ? [] : {paramNameLower}.split(\"|\");");
+                        writer.WriteLine($"{methodNameLower}Signal.set(values);");
+                        writer.WriteLine($"getOrCreateChannel(instanceId ?? \"default\").{methodNameLower}Signal.set(values);");
+                    }
+                    else if (variable.ReturnType == ReturnType.Json)
+                    {
+                        writer.WriteLine("try {");
                         writer.Indent++;
-                        writer.WriteLine($"{methodNameLower}Signal.set({paramNameLower}.split(\"|\"));");
+                        writer.WriteLine($"const value = JSON.parse({paramNameLower}) as {variable.JsonType.Name};");
+                        writer.WriteLine($"{methodNameLower}Signal.set(value);");
+                        writer.WriteLine($"getOrCreateChannel(instanceId ?? \"default\").{methodNameLower}Signal.set(value);");
+                        writer.Indent--;
+                        writer.WriteLine("} catch (e) {");
+                        writer.Indent++;
+                        writer.WriteLine($"console.error(\"[UnityAngularBridge] Failed to parse {variable.MethodName} JSON:\", e);");
+                        writer.Indent--;
+                        writer.WriteLine("}");
                     }
                     else
                     {
-                        writer.WriteLine($"(window as any)[\"{windowFnName}\"] = ({paramNameLower}: string): void => {{");
-                        writer.Indent++;
                         writer.WriteLine($"{methodNameLower}Signal.set({paramNameLower});");
+                        writer.WriteLine($"getOrCreateChannel(instanceId ?? \"default\").{methodNameLower}Signal.set({paramNameLower});");
                     }
+
                     writer.Indent--;
                     writer.WriteLine("};");
                 }
                 else
                 {
-                    writer.WriteLine($"(window as any)[\"{windowFnName}\"] = (): void => {{");
+                    writer.WriteLine($"(window as any)[\"{windowFnName}\"] = (instanceId?: string): void => {{");
                     writer.Indent++;
                     writer.WriteLine($"{methodNameLower}Signal.update(v => v + 1);");
+                    writer.WriteLine($"getOrCreateChannel(instanceId ?? \"default\").{methodNameLower}Signal.update(v => v + 1);");
                     writer.Indent--;
                     writer.WriteLine("};");
                 }
@@ -495,9 +645,11 @@ namespace UnityAngularBridge
         private static void WriteServiceClass(IndentedTextWriter writer)
         {
             writer.WriteLine("/**");
-            writer.WriteLine(" * Auto-generated service for Unity \\u2192 Angular communication.");
+            writer.WriteLine(" * Auto-generated service for Unity → Angular communication.");
             writer.WriteLine(" * Signals are updated when Unity calls the corresponding jslib functions.");
             writer.WriteLine(" * Register callback handlers to respond to Unity requests.");
+            writer.WriteLine(" * The flat signals reflect the last event from any instance; use forInstance()");
+            writer.WriteLine(" * to observe a single Unity instance when multiple viewports are on the page.");
             writer.WriteLine(" * See: https://docs.unity3d.com/Manual/webgl-interactingwithbrowserscripting.html");
             writer.WriteLine(" */");
             writer.WriteLine("@Injectable({");
@@ -512,7 +664,7 @@ namespace UnityAngularBridge
             var signalVars = _jSLibVariables.Where(v => v.CallbackType == CallbackType.None).ToList();
             foreach (JSLibVariable variable in signalVars)
             {
-                string name = FirstCharToLowerCase(variable.MethodName)!;
+                string name = BridgeGeneratorUtilities.FirstCharToLowerCase(variable.MethodName)!;
                 string signalName = $"{name}Signal";
 
                 if (!string.IsNullOrEmpty(variable.MethodDocumentation))
@@ -520,49 +672,33 @@ namespace UnityAngularBridge
                     writer.WriteLine($"/** {variable.MethodDocumentation} */");
                 }
 
-                switch (variable.ReturnType)
-                {
-                    case ReturnType.Void:
-                        writer.WriteLine($"readonly {name}: Signal<number> = {signalName}.asReadonly();");
-                        break;
-                    case ReturnType.String:
-                        writer.WriteLine($"readonly {name}: Signal<string | null> = {signalName}.asReadonly();");
-                        break;
-                    case ReturnType.StringArray:
-                        writer.WriteLine($"readonly {name}: Signal<string[]> = {signalName}.asReadonly();");
-                        break;
-                }
+                writer.WriteLine($"readonly {name}: Signal<{GetSignalTsType(variable)}> = {signalName}.asReadonly();");
             }
+
+            // Per-instance access
+            writer.WriteLine();
+            writer.WriteLine("/** Per-instance view of the Unity → Angular channels, keyed by the Unity canvas DOM id. */");
+            writer.WriteLine("forInstance(instanceId: string): UnityJSLibInstanceChannel {");
+            writer.Indent++;
+            writer.WriteLine("return getOrCreateChannel(instanceId);");
+            writer.Indent--;
+            writer.WriteLine("}");
 
             // Callback methods
             var callbackVars = _jSLibVariables.Where(v => v.CallbackType != CallbackType.None).ToList();
-            if (callbackVars.Any() && signalVars.Any())
-            {
-                writer.WriteLine();
-            }
 
-            foreach ((JSLibVariable variable, int index, bool isLast) in
-                callbackVars.Select((v, i) => (v, i, i == callbackVars.Count - 1)))
+            foreach (JSLibVariable variable in callbackVars)
             {
-                string name = FirstCharToLowerCase(variable.MethodName)!;
+                string name = BridgeGeneratorUtilities.FirstCharToLowerCase(variable.MethodName)!;
+                writer.WriteLine();
 
                 if (variable.CallbackType == CallbackType.RequestResponse)
                 {
-                    bool hasData = !string.IsNullOrEmpty(variable.ParameterName);
                     string doc = !string.IsNullOrEmpty(variable.MethodDocumentation)
                         ? variable.MethodDocumentation
                         : $"Register a handler for {variable.MethodName} requests from Unity.";
-                    writer.WriteLine($"/** {doc} */");
-
-                    if (hasData && variable.CallbackHasStringParam)
-                        writer.WriteLine($"register{variable.MethodName}Handler(handler: (query: string, respond: (result: string) => void) => void): void {{");
-                    else if (hasData)
-                        writer.WriteLine($"register{variable.MethodName}Handler(handler: (query: string, respond: () => void) => void): void {{");
-                    else if (variable.CallbackHasStringParam)
-                        writer.WriteLine($"register{variable.MethodName}Handler(handler: (respond: (result: string) => void) => void): void {{");
-                    else
-                        writer.WriteLine($"register{variable.MethodName}Handler(handler: (respond: () => void) => void): void {{");
-
+                    writer.WriteLine($"/** {doc} Used for any instance without its own forInstance() handler. */");
+                    writer.WriteLine($"register{variable.MethodName}Handler(handler: {GetRequestResponseHandlerSignature(variable)}): void {{");
                     writer.Indent++;
                     writer.WriteLine($"{name}Handler = handler;");
                     writer.Indent--;
@@ -570,31 +706,43 @@ namespace UnityAngularBridge
                 }
                 else // Registration
                 {
-                    string baseName = variable.MethodName.StartsWith("Register")
-                        ? variable.MethodName.Substring("Register".Length)
-                        : variable.MethodName;
+                    string baseName = GetRegistrationBaseName(variable);
                     string doc = !string.IsNullOrEmpty(variable.MethodDocumentation)
                         ? variable.MethodDocumentation
                         : $"Invoke the callback registered by Unity via {variable.MethodName}.";
-                    writer.WriteLine($"/** {doc} */");
+                    writer.WriteLine($"/** {doc} Broadcasts to all instances; use forInstance() to target one. */");
 
                     if (variable.CallbackHasStringParam)
                     {
                         writer.WriteLine($"notify{baseName}(data: string): void {{");
                         writer.Indent++;
+                        writer.WriteLine("if (channels.size > 0) {");
+                        writer.Indent++;
+                        writer.WriteLine($"channels.forEach((channel) => channel.{name}Callback?.(data));");
+                        writer.Indent--;
+                        writer.WriteLine("} else {");
+                        writer.Indent++;
                         writer.WriteLine($"{name}Callback?.(data);");
+                        writer.Indent--;
+                        writer.WriteLine("}");
                     }
                     else
                     {
                         writer.WriteLine($"notify{baseName}(): void {{");
                         writer.Indent++;
+                        writer.WriteLine("if (channels.size > 0) {");
+                        writer.Indent++;
+                        writer.WriteLine($"channels.forEach((channel) => channel.{name}Callback?.());");
+                        writer.Indent--;
+                        writer.WriteLine("} else {");
+                        writer.Indent++;
                         writer.WriteLine($"{name}Callback?.();");
+                        writer.Indent--;
+                        writer.WriteLine("}");
                     }
                     writer.Indent--;
                     writer.WriteLine("}");
                 }
-
-                if (!isLast) writer.WriteLine();
             }
 
             writer.Indent--;
@@ -613,15 +761,6 @@ namespace UnityAngularBridge
                 Directory.CreateDirectory(path);
             }
             return path;
-        }
-
-        private static string? FirstCharToLowerCase(string? str)
-        {
-            if (!string.IsNullOrEmpty(str) && char.IsUpper(str[0]))
-            {
-                return str.Length == 1 ? char.ToLower(str[0]).ToString() : char.ToLower(str[0]) + str[1..];
-            }
-            return str;
         }
 
         #endregion

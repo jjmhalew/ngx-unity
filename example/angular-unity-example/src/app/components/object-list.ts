@@ -65,6 +65,9 @@ import { UnityBridgeService } from '../services/unity-bridge.service';
         </span>
         <span>Objects: {{ bridge.objectCount() }}</span>
         <span>Selected: {{ bridge.selectedObject() ?? 'None' }}</span>
+        @if (bridge.sceneState(); as state) {
+          <span>Scene state (JSON): {{ state.objectCount }} objects, {{ state.visible ? 'visible' : 'hidden' }}</span>
+        }
       </div>
 
       @if (bridge.objectsList().length > 0) {

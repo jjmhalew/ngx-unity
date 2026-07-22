@@ -18,6 +18,36 @@ using UnityEngine;
 public class SceneManager : MonoBehaviour
 {
     // ──────────────────────────────────────────────────────────────────
+    //  JSON DTOs
+    //  Referenced via JsonType on the attributes below; the generators emit
+    //  matching TypeScript interfaces for them.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Scene state snapshot sent to Angular as JSON.
+    /// </summary>
+    [Serializable]
+    public class SceneState
+    {
+        public string selectedObjectId;
+        public int objectCount;
+        public bool visible;
+    }
+
+    /// <summary>
+    /// Spawn request received from Angular as JSON.
+    /// </summary>
+    [Serializable]
+    public class SpawnRequest
+    {
+        public string objectId;
+        public float x;
+        public float y;
+        public float z;
+        public string colorHex;
+    }
+
+    // ──────────────────────────────────────────────────────────────────
     //  Unity → Angular  (JSLib / DllImport)
     //  These generate BrowserInteractions.jslib + unity-jslib-exported.service.ts
     // ──────────────────────────────────────────────────────────────────
@@ -42,6 +72,13 @@ public class SceneManager : MonoBehaviour
     [DllImport("__Internal")]
     [JSLibExport(IsStringArray = true, Category = "Objects")]
     private static extern void SendObjectsList(string objectIds);
+
+    /// <summary>
+    /// Sends the current scene state to Angular as a typed JSON object.
+    /// </summary>
+    [DllImport("__Internal")]
+    [JSLibExport(JsonType = typeof(SceneState), Category = "State")]
+    private static extern void SendSceneState(string json);
 
     // ──────────────────────────────────────────────────────────────────
     //  Callbacks  (Request-Response & Event Registration)
@@ -146,6 +183,31 @@ public class SceneManager : MonoBehaviour
         {
             obj.SetActive(_visible);
         }
+        PublishSceneState();
+    }
+
+    /// <summary>
+    /// Spawn a new object from a typed JSON request. Called from Angular.
+    /// </summary>
+    [AngularExposed(gameObjectName: "SceneManager", JsonType = typeof(SpawnRequest))]
+    public void SpawnFromJson(string request)
+    {
+        SpawnRequest spawnRequest = JsonUtility.FromJson<SpawnRequest>(request);
+        Debug.Log($"[SceneManager] SpawnFromJson({spawnRequest.objectId})");
+
+        SpawnObject(spawnRequest.objectId, PrimitiveType.Cube, new Vector3(spawnRequest.x, spawnRequest.y, spawnRequest.z));
+
+        if (!string.IsNullOrEmpty(spawnRequest.colorHex)
+            && ColorUtility.TryParseHtmlString(spawnRequest.colorHex, out Color color))
+        {
+            var renderer = _objects[spawnRequest.objectId].GetComponent<Renderer>();
+            if (renderer != null)
+            {
+                renderer.material.color = color;
+            }
+        }
+
+        PublishSceneState();
     }
 
     /// <summary>
@@ -178,6 +240,7 @@ public class SceneManager : MonoBehaviour
         SendSceneReady();
         RequestDataFromWeb("scene-reset", OnDataReceived);
 #endif
+        PublishSceneState();
     }
 
     private void Start()
@@ -213,6 +276,22 @@ public class SceneManager : MonoBehaviour
         }
 
         _objects[id] = go;
+    }
+
+    /// <summary>
+    /// Push a JSON snapshot of the scene state to Angular.
+    /// </summary>
+    private void PublishSceneState()
+    {
+#if PLATFORM_WEBGL && !UNITY_EDITOR
+        SceneState state = new SceneState
+        {
+            selectedObjectId = _selectedObjectId ?? string.Empty,
+            objectCount = _objects.Count,
+            visible = _visible,
+        };
+        SendSceneState(JsonUtility.ToJson(state));
+#endif
     }
 
     private void HighlightObject(GameObject go, bool selected)

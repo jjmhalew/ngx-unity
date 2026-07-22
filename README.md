@@ -1,7 +1,8 @@
 ![Release](https://img.shields.io/github/v/release/jjmhalew/ngx-unity)
+[![CI](https://github.com/jjmhalew/ngx-unity/actions/workflows/ci.yml/badge.svg)](https://github.com/jjmhalew/ngx-unity/actions/workflows/ci.yml)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/jjmhalew/ngx-unity)
 ![Downloads](https://img.shields.io/npm/dw/ngx-unity)
-[![License](https://img.shields.io/:license-GNU-blue.svg?style=flat)](https://opensource.org/licenses/GNU)
+[![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg?style=flat)](LICENSE)
 
 <img width="170" height="180" alt="ngx-unity logo" src="https://github.com/user-attachments/assets/2eb16db5-f296-49b0-a0af-a2e43a7d9ac0" />
 
@@ -21,8 +22,10 @@ https://ngx-unity.web.app/
 
 ## Features
 
-- **Angular → Unity**: Call Unity methods from Angular via auto-generated `UnityClient.ts`
+- **Angular → Unity**: Call Unity methods from Angular via auto-generated `unity-client.ts`
 - **Unity → Angular**: Receive Unity events in Angular via auto-generated signals (no RxJS required)
+- **Typed JSON payloads**: Declare a `[Serializable]` DTO via `JsonType` and get a generated TypeScript interface plus automatic `JSON.stringify`/`JSON.parse`
+- **Multi-instance routing**: Unity → Angular events carry the originating canvas id; observe a single instance via `forInstance(canvasId)`
 - **Callback Support**: Request-response and event registration patterns between C# and JavaScript
 - **TSDoc Generation**: C# XML documentation automatically appears in generated TypeScript
 - **Custom Attributes**: `[AngularExposed]` and `[JSLibExport]` for clean, declarative setup
@@ -32,7 +35,8 @@ https://ngx-unity.web.app/
 ## Requirements
 
 - Unity 2021.2+ (for `makeDynCall` callback support)
-- Angular 16+ (for signals support)
+- Angular 22+ (the library and generated code use `input()`, `output()`, `viewChild.required()` and signals)
+- Node 24+ to build and test the example workspace
 
 ## Quick Start
 
@@ -42,8 +46,9 @@ https://ngx-unity.web.app/
 
 2. **Configure the output paths** (optional):
    `Tools > UnityAngularBridge > Settings`
-   Set where `UnityClient.ts` and `unity-jslib-exported.service.ts` are generated.
-   By default, `UnityClient.ts` goes to your Documents folder.
+   Set where `unity-client.ts` and `unity-jslib-exported.service.ts` are generated.
+   By default, `unity-client.ts` goes to your Documents folder.
+   *(Upgrading? The client file was renamed from `UnityClient.ts` to `unity-client.ts` — delete the old file.)*
 
 3. **Enable callback support** (if using callbacks):
    `Tools > UnityAngularBridge > Enable Callback Support`
@@ -129,13 +134,16 @@ export class UnityClient {
 - Maximum 1 parameter per method
 - The `gameObjectName` identifies which Unity GameObject receives the `SendMessage` call
 - Optional `Documentation` property overrides the TSDoc output
+- For complex objects, use `JsonType` (see [Typed JSON Payloads](#typed-json-payloads))
 
 **Note**: Generation happens at compile time / Play mode, not at runtime. A default GameObject name is used unless overridden in `[AngularExposed]`.
 
 ### How to update
 
 Recompile or click on 'Play' in Unity editor to trigger `AngularExposedExport.cs`.
-This will automatically generate `UnityClient.ts` to the configured output path.
+This will automatically generate `unity-client.ts` to the configured output path.
+Files are only rewritten when their content actually changes, so the Angular dev
+server is not triggered by every Unity domain reload.
 
 ---
 
@@ -199,9 +207,13 @@ export class UnityJSLibExportedService {
 | Property | Type | Default | Description |
 |---|---|---|---|
 | `IsStringArray` | `bool` | `false` | Split pipe-delimited string into `string[]` |
+| `JsonType` | `Type` | `null` | `[Serializable]` DTO type — payload is `JSON.parse`d into a typed signal |
 | `Category` | `string` | `""` | Organize methods (for documentation) |
 | `Documentation` | `string` | `""` | Override TSDoc (falls back to XML docs) |
 | `IsCallbackRegistration` | `bool` | `false` | Mark as callback registration point |
+
+> **Note:** `IsStringArray` values are pipe-delimited, so individual values must
+> not contain the `|` character. Use `JsonType` when values can contain arbitrary text.
 
 ### How to update
 
@@ -209,6 +221,97 @@ Recompile or click on 'Play' in Unity editor to trigger `JSLibExport.cs`.
 This will automatically generate:
 1. `BrowserInteractions.jslib` — placed in `Assets/Plugins/`
 2. `unity-jslib-exported.service.ts` — placed at the configured output path
+
+---
+
+## Typed JSON Payloads
+
+Both directions support complex objects via JSON. Declare a `[Serializable]` DTO
+class with the `JsonType` attribute property; the generators emit a matching
+TypeScript interface and handle serialization automatically.
+
+### Angular → Unity
+
+The C# method keeps a single `string` parameter and deserializes it itself
+(`SendMessage` can only carry strings); the generated TypeScript wrapper is fully typed:
+
+```csharp
+[Serializable]
+public class SpawnRequest
+{
+    public string objectId;
+    public float x;
+    public float y;
+    public float z;
+    public string colorHex;
+}
+
+[AngularExposed(gameObjectName: "SceneManager", JsonType = typeof(SpawnRequest))]
+public void SpawnFromJson(string request)
+{
+    SpawnRequest spawnRequest = JsonUtility.FromJson<SpawnRequest>(request);
+    // Your logic here
+}
+```
+
+Generated TypeScript:
+
+```typescript
+export interface SpawnRequest {
+  objectId: string;
+  x: number;
+  y: number;
+  z: number;
+  colorHex: string;
+}
+
+public sceneManager_SpawnFromJson(unityInstance: IUnityInstance, request: SpawnRequest): void {
+  unityInstance?.SendMessage("SceneManager", "SpawnFromJson", JSON.stringify(request));
+}
+```
+
+### Unity → Angular
+
+Pass `JsonUtility.ToJson(obj)` on the C# side; Angular receives a typed signal:
+
+```csharp
+[Serializable]
+public class SceneState
+{
+    public string selectedObjectId;
+    public int objectCount;
+    public bool visible;
+}
+
+[DllImport("__Internal")]
+[JSLibExport(JsonType = typeof(SceneState), Category = "State")]
+private static extern void SendSceneState(string json);
+
+// Usage:
+#if PLATFORM_WEBGL && !UNITY_EDITOR
+    SendSceneState(JsonUtility.ToJson(state));
+#endif
+```
+
+Generated Angular service:
+
+```typescript
+export interface SceneState {
+  selectedObjectId: string;
+  objectCount: number;
+  visible: boolean;
+}
+
+readonly sendSceneState: Signal<SceneState | null>;
+```
+
+### Supported DTO shapes
+
+Mirroring `JsonUtility`'s rules, DTOs may contain **public instance fields** of:
+`string`, `int`, `long`, `float`, `double`, `bool`, arrays / `List<T>` of those,
+and nested `[Serializable]` classes. Properties, dictionaries, and polymorphism
+are not supported. Malformed JSON from Unity is logged to the console and the
+signal keeps its previous value.
 
 ---
 
@@ -299,8 +402,9 @@ Open `Tools > UnityAngularBridge > Settings` to configure:
 
 | Setting | Default | Description |
 |---|---|---|
-| UnityClient.ts path | MyDocuments | Where the Angular-to-Unity client is generated |
+| unity-client.ts path | MyDocuments | Where the Angular-to-Unity client is generated |
 | Service .ts path | Assets/Plugins | Where the Unity-to-Angular service is generated |
+| IUnityInstance import path | `ngx-unity` | Module the generated client imports `IUnityInstance` from; leave empty to emit an inline interface (for consumers not using ngx-unity) |
 
 Paths can be absolute or relative to the Unity project folder.
 
@@ -332,11 +436,20 @@ A drop-in component that handles Unity WebGL/WebGPU loading with automatic mock 
 |---|---|---|---|
 | `buildPath` | `string` | `'unity'` | Path to Unity WebGL/WebGPU build (relative to `public/`) |
 | `height` | `string` | `'400px'` | CSS height of the canvas |
+| `canvasId` | `string` | auto-generated | DOM id for the canvas; keys `forInstance()` routing |
 | `mockFactory` | `() => IUnityInstance` | built-in mock | Custom mock factory for development |
+| `fallbackToMock` | `boolean` | `true` | Fall back to a mock when a real build fails to load; set `false` to surface the failure instead |
 
 | Output | Type | Description |
 |---|---|---|
 | `instanceReady` | `IUnityInstance` | Emitted when Unity (or mock) is ready |
+| `instanceCreated` | `{ instance, canvasId }` | Like `instanceReady`, plus the canvas id for per-instance routing |
+| `loadError` | `Error` | Emitted when a build was found but failed to load (even when falling back to a mock) |
+
+A **missing** build always falls back to a mock (intended for development without
+a Unity build). `fallbackToMock` only governs what happens when a build exists
+but fails to load; with `fallbackToMock=false` the `loadFailed` signal is set and
+an error overlay is shown.
 
 ### `createMockUnityInstance()`
 
@@ -358,40 +471,52 @@ Multiple `<ngx-unity-viewport>` components can coexist on the same page.
 Each viewport creates its own `<canvas>` with a unique DOM ID, and the Unity
 loader script is loaded only once even when viewports share the same `buildPath`.
 
+The generated jslib automatically tags every Unity → Angular call with the
+originating canvas id (`Module.canvas.id`), so the generated service can route
+events per instance — no handshake or extra Unity code required:
+
 ```html
 <!-- Two viewports side by side using the same Unity build -->
 <ngx-unity-viewport
   buildPath="unity"
   height="300px"
-  (instanceReady)="onFirstReady($event)" />
+  (instanceCreated)="onReady($event)" />
 
 <ngx-unity-viewport
   buildPath="unity"
   height="300px"
-  (instanceReady)="onSecondReady($event)" />
+  (instanceCreated)="onReady($event)" />
 ```
-
-Each viewport emits its own `instanceReady` event with an independent
-`IUnityInstance`, so you can wire each one to a separate bridge service or
-handle them individually:
 
 ```typescript
-instances: IUnityInstance[] = [];
+private readonly jsLib = inject(UnityJSLibExportedService);
 
-onFirstReady(instance: IUnityInstance): void {
-  this.instances[0] = instance;
-}
+onReady(event: { instance: IUnityInstance; canvasId: string }): void {
+  // Per-instance signals, isolated from the other viewport:
+  const channel = this.jsLib.forInstance(event.canvasId);
+  const selected = channel.sendSelectedObject; // Signal<string | null>
 
-onSecondReady(instance: IUnityInstance): void {
-  this.instances[1] = instance;
+  // Per-instance callbacks:
+  channel.registerRequestDataFromWebHandler((query, respond) => respond('...'));
+  channel.notifyOnNavigationChanged('/route'); // targets only this instance
 }
 ```
 
-> **Note:** The auto-generated `UnityJSLibExportedService` registers global
-> `window` callbacks, so Unity → Angular signals (e.g. `sendSelectedObject`)
-> reflect the most recent event from *any* instance. If you need per-instance
-> isolation for Unity → Angular events, maintain separate state in your
-> bridge service keyed by each `IUnityInstance`.
+Semantics:
+
+- The **flat signals** on the service (e.g. `jsLib.sendSelectedObject`) keep their
+  original behavior: they reflect the most recent event from *any* instance —
+  single-viewport apps need no changes.
+- `forInstance(canvasId)` returns a channel with the same signal set, isolated per instance.
+- Request-response calls prefer a channel handler registered via
+  `forInstance(id).register...Handler`, falling back to the flat handler.
+- The flat `notify...()` methods broadcast to all instances; use
+  `forInstance(id).notify...()` to target one.
+- Events from a jslib built **before** this feature carry no canvas id and are
+  routed to the `"default"` channel — regenerate the `.jslib` and the service
+  together to keep them in sync.
+- If the canvas has no DOM id (custom templates, OffscreenCanvas), events fall
+  back to the `"default"` channel, matching the old single-instance behavior.
 
 ---
 
@@ -419,7 +544,22 @@ ngx-unity/
 
 ---
 
+## Running Tests
+
+The example workspace contains a vitest suite covering the library component,
+mock utilities, and the generated bridge code contract:
+
+```bash
+cd example/angular-unity-example && npm ci && npm run build:ngx-unity && npm test
+```
+
+The [CI workflow](.github/workflows/ci.yml) runs the same build + test sequence
+on every push and pull request.
+
+---
+
 ## TODO
 
 - [ ] Distribute Unity scripts as a UPM package (git URL)
-- [ ] Auto-generate JSON serialization for complex Angular→Unity parameters
+- [x] Auto-generate JSON serialization for complex Angular→Unity parameters (`JsonType`)
+- [x] Per-instance Unity → Angular event routing (`forInstance`)

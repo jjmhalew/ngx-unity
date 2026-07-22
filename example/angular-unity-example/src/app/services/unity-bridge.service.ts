@@ -1,6 +1,6 @@
 import { computed, inject, Injectable, signal } from '@angular/core';
 import type { IUnityInstance } from 'ngx-unity';
-import { UnityClient } from '../generated/unity-client';
+import { SpawnRequest, UnityClient } from '../generated/unity-client';
 import { UnityJSLibExportedService } from '../generated/unity-jslib-exported.service';
 
 /**
@@ -23,6 +23,7 @@ export class UnityBridgeService {
   // ----- Signals from Unity events (Unity → Angular via JSLib) -----
   readonly selectedObject = this.jsLibService.sendSelectedObject;
   readonly objectsList = this.jsLibService.sendObjectsList;
+  readonly sceneState = this.jsLibService.sendSceneState;
 
   // ----- Computed signals -----
   readonly objectCount = computed(() => this.objectsList().length);
@@ -69,6 +70,14 @@ export class UnityBridgeService {
     const instance = this._unityInstance();
     if (instance) {
       this.unityClient.sceneManager_ResetScene(instance);
+    }
+  }
+
+  /** Spawn a new object in the scene from a typed request (sent to Unity as JSON). */
+  spawnObject(request: SpawnRequest): void {
+    const instance = this._unityInstance();
+    if (instance) {
+      this.unityClient.sceneManager_SpawnFromJson(instance, request);
     }
   }
 

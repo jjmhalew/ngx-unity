@@ -6,69 +6,105 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
-using System.Xml.Linq;
 using UnityEditor;
 using UnityEngine;
 
 namespace UnityAngularBridge
 {
     /// <summary>
-    /// Generates UnityClient.ts — a TypeScript class for calling Unity methods from Angular.
+    /// Generates unity-client.ts — a TypeScript class for calling Unity methods from Angular.
     /// Scans for [AngularExposed] methods and generates typed SendMessage wrappers.
+    /// Methods with JsonType get a generated TS interface and a JSON.stringify wrapper.
     /// Supports XML doc → TSDoc and configurable output paths.
     /// </summary>
     [InitializeOnLoad]
     public class AngularExposedExport
     {
-        private static readonly string _angularTsClientFileName = "UnityClient.ts";
+        private static readonly string _angularTsClientFileName = "unity-client.ts";
         private static readonly string _tabString = "  ";
         private static readonly Dictionary<string, string> _xmlDocs = new();
 
         static AngularExposedExport()
         {
-            LoadXmlDocumentation();
-            GenerateUnityClient();
-        }
-
-        #region XmlDocumentation
-
-        private static void LoadXmlDocumentation()
-        {
-            _xmlDocs.Clear();
             try
             {
-                string xmlPath = Path.Combine(Application.dataPath, "..", "Library", "ScriptAssemblies", "Assembly-CSharp.xml");
-                if (!File.Exists(xmlPath)) return;
-
-                XDocument doc = XDocument.Load(xmlPath);
-                foreach (var member in doc.Descendants("member"))
-                {
-                    string? name = member.Attribute("name")?.Value;
-                    string? summary = member.Element("summary")?.Value;
-                    if (!string.IsNullOrEmpty(name) && !string.IsNullOrEmpty(summary))
-                    {
-                        string cleaned = summary.Trim().Replace("\r\n", " ").Replace("\n", " ");
-                        while (cleaned.Contains("  "))
-                            cleaned = cleaned.Replace("  ", " ");
-                        _xmlDocs[name] = cleaned;
-                    }
-                }
+                BridgeGeneratorUtilities.LoadXmlDocumentation(_xmlDocs);
+                GenerateUnityClient();
             }
             catch (Exception e)
             {
-                Debug.LogWarning($"[UnityAngularBridge] Could not load XML documentation: {e.Message}");
+                Debug.LogError($"[UnityAngularBridge] unity-client.ts generation failed: {e}");
             }
         }
 
-        private static string GetXmlDocumentation(Type type, MethodInfo methodInfo)
+        private class ExposedMethod
         {
-            string paramTypes = string.Join(",",
-                methodInfo.GetParameters().Select(p => p.ParameterType.FullName ?? p.ParameterType.Name));
-            string memberName = methodInfo.GetParameters().Length > 0
-                ? $"M:{type.FullName}.{methodInfo.Name}({paramTypes})"
-                : $"M:{type.FullName}.{methodInfo.Name}";
+            public string GameObjectName = string.Empty;
+            public string MethodName = string.Empty;
+            public string Documentation = string.Empty;
+            public string ParameterType = string.Empty;
+            public string ParameterName = string.Empty;
+            public Type? JsonType;
+        }
 
-            return _xmlDocs.TryGetValue(memberName, out string? doc) ? doc : string.Empty;
+        #region Scanning
+
+        private static List<ExposedMethod> ScanMethods()
+        {
+            List<ExposedMethod> methods = new();
+            Assembly assembly = Assembly.GetExecutingAssembly();
+            IEnumerable<Type> publicClasses = assembly.GetExportedTypes().Where(p => p.IsClass);
+
+            foreach (Type type in publicClasses)
+            {
+                IEnumerable<MethodInfo> methodInfos = type
+                    .GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Static)
+                    .Where(m => m.GetCustomAttributes(typeof(AngularExposedAttribute), false).Length > 0);
+
+                foreach (MethodInfo methodInfo in methodInfos)
+                {
+                    AngularExposedAttribute attribute = methodInfo.GetCustomAttribute<AngularExposedAttribute>()!;
+
+                    ExposedMethod method = new()
+                    {
+                        GameObjectName = attribute.GameObjectName,
+                        MethodName = methodInfo.Name,
+                        JsonType = attribute.JsonType,
+                    };
+
+                    // Get documentation: attribute override > XML docs
+                    method.Documentation = !string.IsNullOrEmpty(attribute.Documentation)
+                        ? attribute.Documentation
+                        : BridgeGeneratorUtilities.GetXmlDocumentation(_xmlDocs, type, methodInfo);
+
+                    ParameterInfo[] parameters = methodInfo.GetParameters();
+                    if (parameters.Length > 1)
+                    {
+                        throw new InvalidOperationException($"Method {method.MethodName} is only allowed to have 1 argument");
+                    }
+
+                    if (method.JsonType != null)
+                    {
+                        if (parameters.Length != 1 || parameters[0].ParameterType != typeof(string))
+                        {
+                            throw new InvalidOperationException(
+                                $"[UnityAngularBridge] Method {method.MethodName} declares JsonType and must take exactly one string parameter " +
+                                $"(deserialize it with JsonUtility.FromJson<{method.JsonType.Name}>).");
+                        }
+                        method.ParameterType = method.JsonType.Name;
+                        method.ParameterName = parameters[0].Name ?? "request";
+                    }
+                    else if (parameters.Length == 1)
+                    {
+                        method.ParameterType = ParameterTypeToTypescriptType(parameters[0].ParameterType);
+                        method.ParameterName = parameters[0].Name ?? "data";
+                    }
+
+                    methods.Add(method);
+                }
+            }
+
+            return methods;
         }
 
         #endregion
@@ -77,16 +113,35 @@ namespace UnityAngularBridge
 
         private static void GenerateUnityClient()
         {
-            string outputPath = UnityAngularBridgeSettings.GetUnityClientOutputPath();
-            using IndentedTextWriter writer = new(
-                new StreamWriter(Path.Combine(outputPath, _angularTsClientFileName)) { AutoFlush = true },
-                _tabString);
+            List<ExposedMethod> methods = ScanMethods();
+            string importPath = UnityAngularBridgeSettings.GetIUnityInstanceImportPath();
 
-            AddAutoGeneratedFileCommentLines(writer);
-            AddInjectibleClassWithImportLines(writer);
-            GetAndAddMethodsLines(writer);
-            AddClassClosingLines(writer);
-            AddIUnityInstanceInterfaceLines(writer);
+            using StringWriter stringWriter = new();
+            using (IndentedTextWriter writer = new(stringWriter, _tabString))
+            {
+                AddAutoGeneratedFileCommentLines(writer);
+                AddImportLines(writer, importPath);
+                TypeScriptInterfaceGenerator.WriteInterfaces(
+                    writer,
+                    methods.Where(m => m.JsonType != null).Select(m => m.JsonType!).Distinct());
+                AddClassOpeningLines(writer);
+
+                foreach (ExposedMethod method in methods)
+                {
+                    AddMethodLines(writer, method);
+                }
+
+                AddClassClosingLines(writer);
+
+                if (string.IsNullOrEmpty(importPath))
+                {
+                    AddIUnityInstanceInterfaceLines(writer);
+                }
+            }
+
+            string outputPath = UnityAngularBridgeSettings.GetUnityClientOutputPath();
+            BridgeGeneratorUtilities.WriteFileIfChanged(
+                Path.Combine(outputPath, _angularTsClientFileName), stringWriter.ToString());
         }
 
         private static void AddAutoGeneratedFileCommentLines(IndentedTextWriter writer)
@@ -101,85 +156,52 @@ namespace UnityAngularBridge
             writer.WriteLine(string.Empty);
         }
 
-        private static void AddInjectibleClassWithImportLines(IndentedTextWriter writer)
+        private static void AddImportLines(IndentedTextWriter writer, string importPath)
         {
             writer.WriteLine("import { Injectable } from \"@angular/core\";");
+            if (!string.IsNullOrEmpty(importPath))
+            {
+                writer.WriteLine($"import type {{ IUnityInstance }} from \"{importPath}\";");
+                writer.WriteLine(string.Empty);
+                writer.WriteLine("export type { IUnityInstance };");
+            }
             writer.WriteLine(string.Empty);
+        }
+
+        private static void AddClassOpeningLines(IndentedTextWriter writer)
+        {
             writer.WriteLine("@Injectable()");
             writer.WriteLine("export class UnityClient {");
             writer.Indent++;
         }
 
-        private static void GetAndAddMethodsLines(IndentedTextWriter writer)
+        private static void AddMethodLines(IndentedTextWriter writer, ExposedMethod method)
         {
-            Assembly assembly = Assembly.GetExecutingAssembly();
-            IEnumerable<Type> publicClasses = assembly.GetExportedTypes().Where(p => p.IsClass);
+            string gameObjectName = method.GameObjectName;
+            string methodName = method.MethodName;
+            bool hasParameter = !string.IsNullOrEmpty(method.ParameterName);
 
-            foreach (Type type in publicClasses)
+            if (!string.IsNullOrEmpty(method.Documentation))
             {
-                IEnumerable<MethodInfo> methodInfos = type
-                    .GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Static)
-                    .Where(m => m.GetCustomAttributes(typeof(AngularExposedAttribute), false).Length > 0);
-
-                foreach (MethodInfo methodInfo in methodInfos)
-                {
-                    object[] methodAttributes = methodInfo.GetCustomAttributes(typeof(AngularExposedAttribute), false);
-                    string gameObjectName = string.Empty;
-                    string attrDoc = string.Empty;
-
-                    foreach (AngularExposedAttribute attribute in methodAttributes.Cast<AngularExposedAttribute>())
-                    {
-                        gameObjectName = attribute.GameObjectName;
-                        attrDoc = attribute.Documentation;
-                    }
-
-                    string methodName = methodInfo.Name;
-
-                    // Get documentation: attribute override > XML docs
-                    string documentation = !string.IsNullOrEmpty(attrDoc)
-                        ? attrDoc
-                        : GetXmlDocumentation(type, methodInfo);
-
-                    string parameterType = string.Empty;
-                    string parameterName = string.Empty;
-                    ParameterInfo[] parameters = methodInfo.GetParameters();
-                    if (parameters.Length > 1)
-                    {
-                        throw new InvalidOperationException($"Method {methodName} is only allowed to have 1 argument");
-                    }
-                    else if (parameters.Length == 1)
-                    {
-                        parameterType = ParameterTypeToTypescriptType(parameters[0].ParameterType);
-                        parameterName = parameters[0].Name ?? "data";
-                    }
-
-                    AddMethodLines(writer, gameObjectName, methodName, parameterType, parameterName, documentation);
-                }
-            }
-        }
-
-        private static void AddMethodLines(IndentedTextWriter writer, string gameObjectName, string methodName,
-            string? parameterType, string? parameterName, string documentation)
-        {
-            bool hasParameter = !string.IsNullOrEmpty(parameterName);
-
-            if (!string.IsNullOrEmpty(documentation))
-            {
-                writer.WriteLine($"/** {documentation} */");
+                writer.WriteLine($"/** {method.Documentation} */");
             }
 
             if (hasParameter)
             {
-                writer.WriteLine($"public {FirstCharToLowerCase(gameObjectName)}_{methodName}(unityInstance: IUnityInstance, {parameterName}: {parameterType}): void {{");
+                string argument = method.JsonType != null
+                    ? $"JSON.stringify({method.ParameterName})"
+                    : method.ParameterName;
+
+                writer.WriteLine($"public {BridgeGeneratorUtilities.FirstCharToLowerCase(gameObjectName)}_{methodName}(unityInstance: IUnityInstance, {method.ParameterName}: {method.ParameterType}): void {{");
                 writer.Indent++;
-                writer.WriteLine($"unityInstance?.SendMessage(\"{gameObjectName}\", \"{methodName}\", {parameterName});");
+                writer.WriteLine($"unityInstance?.SendMessage(\"{gameObjectName}\", \"{methodName}\", {argument});");
                 writer.Indent--;
                 writer.WriteLine("}");
                 writer.WriteLine(string.Empty);
             }
             else
             {
-                writer.WriteLine($"public {FirstCharToLowerCase(gameObjectName)}_{methodName}(unityInstance: IUnityInstance): void {{");
+                writer.WriteLine($"public {BridgeGeneratorUtilities.FirstCharToLowerCase(gameObjectName)}_{methodName}(unityInstance: IUnityInstance): void {{");
                 writer.Indent++;
                 writer.WriteLine($"unityInstance?.SendMessage(\"{gameObjectName}\", \"{methodName}\");");
                 writer.Indent--;
@@ -220,19 +242,6 @@ namespace UnityAngularBridge
                 _ => throw new InvalidOperationException(
                     $"ParameterType {parameterType} is not supported. Only string and number variants are allowed."),
             };
-        }
-
-        #endregion
-
-        #region Utilities
-
-        private static string? FirstCharToLowerCase(string? str)
-        {
-            if (!string.IsNullOrEmpty(str) && char.IsUpper(str[0]))
-            {
-                return str.Length == 1 ? char.ToLower(str[0]).ToString() : char.ToLower(str[0]) + str[1..];
-            }
-            return str;
         }
 
         #endregion

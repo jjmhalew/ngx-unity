@@ -81,6 +81,9 @@ import { UnityBridgeService } from '../services/unity-bridge.service';
         <button (click)="bridge.resetScene()" [disabled]="!bridge.isConnected()">
           Reset Scene
         </button>
+        <button (click)="spawnObject()" [disabled]="!bridge.isConnected()">
+          Spawn Object (JSON)
+        </button>
       </div>
     </section>
   `,
@@ -89,6 +92,20 @@ export class UnityControls {
   protected readonly bridge = inject(UnityBridgeService);
   protected readonly objectId = signal('Cube-001');
   protected readonly color = signal('#ff6600');
+
+  private spawnCounter = 0;
+
+  /** Demonstrates the typed JSON parameter feature: sends a SpawnRequest object to Unity. */
+  protected spawnObject(): void {
+    this.spawnCounter++;
+    this.bridge.spawnObject({
+      objectId: `Spawned-${String(this.spawnCounter).padStart(3, '0')}`,
+      x: -3 + (this.spawnCounter % 7),
+      y: 2.5,
+      z: 0,
+      colorHex: this.color(),
+    });
+  }
 
   protected toInputValue(event: Event): string {
     return (event.target as HTMLInputElement).value;

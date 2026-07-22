@@ -21,6 +21,13 @@ namespace UnityAngularBridge
         public string Documentation { get; set; } = string.Empty;
 
         /// <summary>
+        /// Serializable DTO type for JSON transport. The generated TypeScript wrapper accepts this
+        /// shape and JSON.stringifies it before SendMessage; the C# method must take a single string
+        /// parameter and deserialize it with JsonUtility.FromJson&lt;T&gt;.
+        /// </summary>
+        public Type JsonType { get; set; }
+
+        /// <summary>
         /// Default constructor.
         /// </summary>
         public AngularExposedAttribute()
