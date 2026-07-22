@@ -19,7 +19,7 @@ import { createProjectMockUnityInstance } from '../services/mock-unity';
       [buildPath]="buildPath()"
       [height]="height()"
       [mockFactory]="mockFactory"
-      (instanceReady)="onInstanceReady($event)" />
+      (instanceCreated)="onInstanceCreated($event)" />
   `,
 })
 export class UnityViewport {
@@ -33,7 +33,9 @@ export class UnityViewport {
 
   protected readonly mockFactory = () => createProjectMockUnityInstance();
 
-  protected onInstanceReady(instance: IUnityInstance): void {
-    this.bridge.setUnityInstance(instance);
+  protected onInstanceCreated(event: { instance: IUnityInstance; canvasId: string }): void {
+    // The canvasId keys per-instance Unity → Angular signals via
+    // UnityJSLibExportedService.forInstance(event.canvasId).
+    this.bridge.setUnityInstance(event.instance);
   }
 }

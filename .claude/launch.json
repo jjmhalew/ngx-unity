@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "angular-demo",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["start", "--prefix", "example/angular-unity-example"],
+      "port": 4200
+    }
+  ]
+}

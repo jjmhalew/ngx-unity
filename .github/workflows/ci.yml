@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: example/angular-unity-example
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: example/angular-unity-example/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Build ngx-unity library
+        run: npm run build:ngx-unity
+      - name: Test library
+        run: npx ng test ngx-unity
+      - name: Test app
+        run: npx ng test angular-unity-example
+      - name: Build app
+        run: npm run build

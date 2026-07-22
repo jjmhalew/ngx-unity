@@ -29,5 +29,12 @@ namespace UnityAngularBridge
         /// Angular can invoke the registered callback to send data to Unity.
         /// </summary>
         public bool IsCallbackRegistration { get; set; }
+
+        /// <summary>
+        /// Serializable DTO type for JSON transport. The C# side passes JsonUtility.ToJson(obj)
+        /// as the string parameter; the generated Angular service exposes a typed signal and
+        /// JSON.parses incoming payloads into it. Mutually exclusive with IsStringArray.
+        /// </summary>
+        public Type JsonType { get; set; }
     }
 }

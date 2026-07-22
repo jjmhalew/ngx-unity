@@ -11,6 +11,14 @@ import type { IUnityInstance } from "ngx-unity";
 
 export type { IUnityInstance };
 
+export interface SpawnRequest {
+  objectId: string;
+  x: number;
+  y: number;
+  z: number;
+  colorHex: string;
+}
+
 @Injectable()
 export class UnityClient {
   /** Load an object by its ID. Called from Angular. */
@@ -26,6 +34,11 @@ export class UnityClient {
   /** Toggle visibility of all objects. Called from Angular. */
   public sceneManager_ToggleVisibility(unityInstance: IUnityInstance): void {
     unityInstance?.SendMessage("SceneManager", "ToggleVisibility");
+  }
+
+  /** Spawn a new object from a typed JSON request. Called from Angular. */
+  public sceneManager_SpawnFromJson(unityInstance: IUnityInstance, request: SpawnRequest): void {
+    unityInstance?.SendMessage("SceneManager", "SpawnFromJson", JSON.stringify(request));
   }
 
   /** Reset the scene to its initial state. Called from Angular. */

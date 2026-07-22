@@ -7,7 +7,9 @@
     "build": "ng build",
     "build:ngx-unity": "ng build ngx-unity",
     "watch": "ng build --watch --configuration development",
-    "test": "ng test"
+    "test": "npm run test:lib && npm run test:app",
+    "test:lib": "ng test ngx-unity",
+    "test:app": "ng test angular-unity-example"
   },
   "private": true,
   "packageManager": "npm@11.9.0",
