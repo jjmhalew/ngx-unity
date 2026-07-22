@@ -561,5 +561,3 @@ on every push and pull request.
 ## TODO
 
 - [ ] Distribute Unity scripts as a UPM package (git URL)
-- [x] Auto-generate JSON serialization for complex Angular→Unity parameters (`JsonType`)
-- [x] Per-instance Unity → Angular event routing (`forInstance`)
